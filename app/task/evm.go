@@ -317,7 +317,38 @@ func (e *evm) parseNativeTransfer(array []gjson.Result, num int, timestamp time.
 
 func (e *evm) parseEventTransfer(b evmBlock, timestamp map[string]time.Time) ([]transfer, error) {
 	transfers := make([]transfer, 0)
-	post := []byte(fmt.Sprintf(`{"jsonrpc":"2.0","method":"eth_getLogs","params":[{"fromBlock":"0x%x","toBlock":"0x%x","topics":["%s"]}],"id":1}`, b.From, b.To, evmTransferEvent))
+
+	// 构建合约地址过滤器（address 字段）
+	contracts := model.GetNetworkContracts(model.Network(e.Network))
+	var addrFilter string
+	if len(contracts) == 1 {
+		addrFilter = fmt.Sprintf(`"address":"%s",`, contracts[0])
+	} else if len(contracts) > 1 {
+		quoted := make([]string, len(contracts))
+		for i, c := range contracts {
+			quoted[i] = fmt.Sprintf(`"%s"`, c)
+		}
+		addrFilter = fmt.Sprintf(`"address":[%s],`, strings.Join(quoted, ","))
+	}
+
+	// 构建钱包地址过滤器（topic[2] = 收款方）
+	wallets := model.GetNetworkWalletAddrs(model.Network(e.Network))
+	var topicFilter string
+	if len(wallets) > 0 {
+		padded := make([]string, len(wallets))
+		for i, w := range wallets {
+			padded[i] = fmt.Sprintf(`"%s"`, "0x000000000000000000000000"+strings.TrimPrefix(w, "0x"))
+		}
+		if len(padded) == 1 {
+			topicFilter = fmt.Sprintf(`["%s",null,%s]`, evmTransferEvent, padded[0])
+		} else {
+			topicFilter = fmt.Sprintf(`["%s",null,[%s]]`, evmTransferEvent, strings.Join(padded, ","))
+		}
+	} else {
+		topicFilter = fmt.Sprintf(`["%s"]`, evmTransferEvent)
+	}
+
+	post := []byte(fmt.Sprintf(`{"jsonrpc":"2.0","method":"eth_getLogs","params":[{%s"fromBlock":"0x%x","toBlock":"0x%x","topics":%s}],"id":1}`, addrFilter, b.From, b.To, topicFilter))
 	resp, err := e.Client.Post(e.rpcEndpoint(), "application/json", bytes.NewBuffer(post))
 	if err != nil {
 

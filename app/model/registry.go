@@ -376,6 +376,39 @@ func GetContractTrade(addr string) (TradeType, bool) {
 	return t, ok
 }
 
+// GetNetworkContracts 返回指定网络下所有代币合约地址（去重）
+func GetNetworkContracts(n Network) []string {
+	trades := GetNetworkTrades(n)
+	contracts := make([]string, 0)
+	seen := make(map[string]bool)
+	for _, t := range trades {
+		if c, ok := registry[t]; ok && c.Contract != "" && !seen[c.Contract] {
+			contracts = append(contracts, c.Contract)
+			seen[c.Contract] = true
+		}
+	}
+
+	return contracts
+}
+
+// GetNetworkWalletAddrs 返回指定网络下所有启用钱包的匹配地址（去重、小写）
+func GetNetworkWalletAddrs(n Network) []string {
+	trades := GetNetworkTrades(n)
+	addrs := make([]string, 0)
+	seen := make(map[string]bool)
+	for _, t := range trades {
+		for _, w := range GetAvailableWallets(t) {
+			addr := strings.ToLower(w.GetMatchAddr())
+			if !seen[addr] {
+				addrs = append(addrs, addr)
+				seen[addr] = true
+			}
+		}
+	}
+
+	return addrs
+}
+
 func GetContractDecimal(addr string) int32 {
 	if d, ok := contractDecimalMap[addr]; ok {
 

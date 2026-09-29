@@ -18,7 +18,7 @@ func bscInit() {
 			ConfirmedOffset: 15,
 		},
 		Native: evmNative{
-			Parse:     true,
+			Parse:     false, // 关闭原生 BNB 整块下载，我们只监控 USDT/USDC 代币转账
 			Decimal:   conf.BscBnbDecimals,
 			TradeType: model.BscBnb,
 		},
