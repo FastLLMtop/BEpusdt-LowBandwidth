@@ -219,7 +219,7 @@ docker run -d \
 
 🌐 官网：**https://fastllm.top**
 💬 Telegram：[@fastllm_top](https://t.me/fastllm_top)
-👥 用户群：[加入群组](https://t.me/+u38ynPMyZpgxMWNl)
+👥 用户群：[加入群组](https://t.me/+zWyJhEL7lrk3ODQ1)
 
 如果这个补丁帮到了你，欢迎 ⭐ Star 支持！
 
