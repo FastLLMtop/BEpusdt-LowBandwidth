@@ -80,8 +80,7 @@ docker run -d --restart=unless-stopped -p 8080:8080 v03413/bepusdt:latest
 
 ## 🏝️ 社区交流
 
-- **Telegram 群组**：[https://t.me/BEpusdtChat](https://t.me/BEpusdtChat)
-- **Telegram 频道**：[https://t.me/BEpusdtChannel](https://t.me/BEpusdtChannel)
+- **Telegram 群组**：[https://t.me/+u38ynPMyZpgxMWNl](https://t.me/+u38ynPMyZpgxMWNl)
 
 ## 🙏 致谢
 
