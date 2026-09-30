@@ -1,27 +1,21 @@
 package task
 
 import (
-	"context"
 	"time"
 
-	"github.com/smallnest/chanx"
 	"github.com/v03413/bepusdt/app/conf"
 	"github.com/v03413/bepusdt/app/utils"
 )
 
 func baseInit() {
-	ctx := context.Background()
 	base := evm{
 		Network: conf.Base,
 		Block: block{
 			ConfirmedOffset: 40,
 		},
-		Client:         utils.NewHttpClient(),
-		blockScanQueue: chanx.NewUnboundedChan[evmBlock](ctx, 30),
+		Client: utils.NewHttpClient(),
 	}
 
-	Register(Task{Callback: base.blockDispatch})
-	Register(Task{Callback: base.syncBlocksForward, Duration: time.Second * 5})
-	Register(Task{Callback: base.tradeConfirmHandle, Duration: time.Second * 5})
-	Register(Task{Callback: base.lookbackBlocks, Duration: time.Second * 15})
+	Register(Task{Duration: time.Second * 10, Callback: base.pollOrderTransfers})
+	Register(Task{Duration: time.Second * 10, Callback: base.tradeConfirmHandle})
 }

@@ -90,32 +90,26 @@ BSC 每个区块有上千笔 ERC20 转账（全网所有代币），全部下载
 
 > ⚠️ 这会关闭 BNB 原生币的收款监控。如果你需要收 BNB，请保留 `true`。收 USDT/USDC 不受影响。
 
-### 改动 2：精准过滤 eth_getLogs
+### 改动 2：按需定时精准轮询（彻底废除扫块死循环队列）
 
-📁 `app/task/evm.go` → `parseEventTransfer()`
+📁 `app/task/evm.go` → `pollOrderTransfers()`
 
-```diff
- // 修改前：拉全网所有 Transfer 事件
--{"topics": ["0xddf252ad..."]}
-+// 修改后：只拉转入我钱包的 + 只看我关心的合约
-+{
-+    "address": "0x55d398...",           // 只看 USDT 合约
-+    "topics": [
-+        "0xddf252ad...",                // Transfer 事件
-+        null,                           // from: 任意
-+        ["0x000...钱包A", "0x000...钱包B"]  // to: 只要转给我的
-+    ]
-+}
-```
+原版采用无界队列并发扫块（3个线程），遇到节点 Rate Limit 限流报错时会以 0 毫秒延迟死循环重试，导致一晚刷出上百兆报错包。
 
-**钱包地址从数据库动态读取，代码中不含任何硬编码地址。** 你在 BEpusdt 后台添加/删除钱包后自动生效。
+**方案 B 彻底重构**：
+- **无待支付订单时**：直接 return，完全静默（0 次网络调用，0 流量）。
+- **有待支付订单时**：每 10 秒单次发起精准 `eth_getLogs`，单次跨度锁定在安全范围（≤ 50 块）。
+- **异常退避断路**：任何 RPC 报错强制 `time.Sleep(10 * time.Second)` 退避，绝不死循环重试。
+- **多节点自动容灾 (Failover)**：主节点故障时自动无缝切换备用节点（`1rpc.io/bnb`）。
 
-### 改动 3：新增辅助函数
+### 改动 3：新增辅助函数与各 EVM 链统一适配
 
-📁 `app/model/registry.go`
+📁 `app/model/registry.go` & `app/task/*.go`
 
 - `GetNetworkContracts(network)` — 获取指定链的代币合约地址列表
 - `GetNetworkWalletAddrs(network)` — 获取指定链的启用钱包地址列表
+- `bsc.go`, `arbitrum.go`, `base.go`, `ethereum.go`, `plasma.go`, `polygon.go`, `xlayer.go` 全部接入统一的 `pollOrderTransfers` 按需轮询机制。
+- 附带完整自动化单元测试 `app/task/evm_scheme_b_test.go`。
 
 ---
 

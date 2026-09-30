@@ -12,28 +12,26 @@ import (
 	"sync"
 	"time"
 
-	"github.com/panjf2000/ants/v2"
 	"github.com/shopspring/decimal"
 	"github.com/smallnest/chanx"
 	"github.com/spf13/cast"
 	"github.com/tidwall/gjson"
 	"github.com/v03413/bepusdt/app/conf"
-	blockapi "github.com/v03413/bepusdt/app/core"
 	"github.com/v03413/bepusdt/app/log"
 	"github.com/v03413/bepusdt/app/model"
 	"github.com/v03413/bepusdt/app/utils"
 )
 
 const (
-	blockParseMaxNum = 10 // 每次解析区块的最大数量
 	evmTransferEvent = "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef"
+	maxQueryBlockSpan = 50 // 单次 eth_getLogs 最大扫描区块跨度（确保在所有公共节点限额内）
 )
 
 var chainBlockNum sync.Map
 
 type block struct {
-	RollDelayOffset int64 // 延迟偏移量，某些RPC节点如果不延迟，会报错 block is out of range，目前发现 https://rpc.xlayer.tech/ 存在此问题
-	ConfirmedOffset int   // 确认偏移量，开启交易确认后，区块高度需要减去此值认为交易已确认
+	RollDelayOffset int64 // 延迟偏移量
+	ConfirmedOffset int   // 确认偏移量
 }
 
 type evmNative struct {
@@ -42,368 +40,202 @@ type evmNative struct {
 	TradeType model.TradeType
 }
 
-type evm struct {
-	Network          string
-	Block            block
-	Native           evmNative
-	Client           *http.Client
-	blockScanQueue   *chanx.UnboundedChan[evmBlock]
-	LookbackInterval time.Duration // 回溯时每批入队的间隔，控制 RPC 调用速率；默认 500ms
-}
-
 type evmBlock struct {
 	From int64
 	To   int64
 }
 
-func (e *evm) syncBlocksForward(ctx context.Context) {
-	if syncBreak(e.Network, e.blockScanQueue.Len()) {
-
-		return
-	}
-
-	post := []byte(`{"jsonrpc":"2.0","method":"eth_blockNumber","params":[],"id":1}`)
-	req, err := http.NewRequestWithContext(ctx, "POST", e.rpcEndpoint(), bytes.NewBuffer(post))
-	if err != nil {
-		log.Task.Warn("Error creating request:", err)
-
-		return
-	}
-
-	req.Header.Set("Content-Type", "application/json")
-	resp, err := e.Client.Do(req)
-	if err != nil {
-		log.Task.Warn("Error sending request:", err)
-
-		return
-	}
-
-	defer resp.Body.Close()
-
-	body, err := io.ReadAll(resp.Body)
-	if err != nil {
-		log.Task.Warn("Error reading response body:", err)
-
-		return
-	}
-
-	var res = gjson.ParseBytes(body)
-	if !res.IsObject() {
-		log.Task.Warn(fmt.Sprintf("EVM 数据解析错误(%s): %s", e.Network, string(body)))
-
-		return
-	}
-
-	var now = utils.HexStr2Int(res.Get("result").String()).Int64() - e.Block.RollDelayOffset
-	if now <= 0 {
-
-		return
-	}
-
-	var lastBlockNumber int64
-	if v, ok := chainBlockNum.Load(e.Network); ok {
-		lastBlockNumber = v.(int64)
-	}
-
-	if now-lastBlockNumber > cast.ToInt64(model.GetC(model.BlockHeightMaxDiff)) {
-
-		lastBlockNumber = now - 1
-	}
-
-	chainBlockNum.Store(e.Network, now)
-	if now <= lastBlockNumber {
-
-		return
-	}
-
-	for from := lastBlockNumber + 1; from <= now; from += blockParseMaxNum {
-		to := from + blockParseMaxNum - 1
-		if to > now {
-			to = now
-		}
-
-		e.blockScanQueue.In <- evmBlock{From: from, To: to}
-	}
+type evm struct {
+	Network           string
+	RpcEndpoint       string                        // 指定节点地址（优先使用）
+	FallbackEndpoints []string                      // 指定备用节点列表
+	Block             block
+	Native            evmNative
+	Client            *http.Client
+	blockScanQueue    *chanx.UnboundedChan[evmBlock] // 保留兼容字段
+	LookbackInterval  time.Duration                 // 保留兼容字段
 }
 
-func (e *evm) lookbackBlocks(ctx context.Context) {
-	if syncBreak(e.Network, e.blockScanQueue.Len()) {
+// pollOrderTransfers 核心按需轮询：仅在有活跃待支付/确认订单时发起单次定向查询，彻底废除无界重试队列
+func (e *evm) pollOrderTransfers(ctx context.Context) {
+	trades := model.GetNetworkTrades(model.Network(e.Network))
+	if len(trades) == 0 {
 		return
 	}
 
-	startAt, endAt, ok := getLookbackUnix(model.Network(e.Network))
-	if !ok {
+	// 1. 检查是否有需要监听的订单 (等待支付 1、过期缓冲 3、待确认 5)
+	var activeOrders []model.Order
+	model.Db.Where("status in (?) and trade_type in (?)", receivableOrderStatuses(), trades).
+		Where("expired_at > ?", time.Now().Add(model.GetLookbackHour())).
+		Find(&activeOrders)
+
+	// 2. 检查是否有开启"其他通知"的收款钱包 (监听外部充值)
+	var otherNotifyCount int64
+	model.Db.Model(&model.Wallet{}).
+		Where("other_notify = ? and trade_type in (?)", model.WaOtherEnable, trades).
+		Count(&otherNotifyCount)
+
+	// 没有任何需要监控的订单或钱包，直接静默退出（0 次网络请求，0 字节流量）
+	if len(activeOrders) == 0 && otherNotifyCount == 0 {
 		return
 	}
 
-	interval := e.LookbackInterval
-	if interval <= 0 {
-		interval = time.Millisecond * 300
+	// 3. 收集需要监控的目标收款地址
+	wallets := model.GetNetworkWalletAddrs(model.Network(e.Network))
+	if len(wallets) == 0 {
+		return
 	}
 
-	start, end := blockapi.New().GetBoundaryHeights(startAt, endAt, e.Network)
-	for i := start; i <= end; i += blockParseMaxNum {
-		select {
-		case <-ctx.Done():
-			return
-		default:
-		}
-		if syncBreak(e.Network, e.blockScanQueue.Len()) {
-			return
-		}
-		to := i + blockParseMaxNum - 1
-		if to > end {
-			to = end
-		}
-		e.blockScanQueue.In <- evmBlock{From: i, To: to}
-		time.Sleep(interval)
+	// 4. 收集代币合约地址 (USDT/USDC 等)
+	contracts := model.GetNetworkContracts(model.Network(e.Network))
+	if len(contracts) == 0 {
+		return
 	}
-}
 
-func (e *evm) blockDispatch(ctx context.Context) {
-	p, err := ants.NewPoolWithFunc(3, e.getBlockByNumber)
+	// 5. 获取链上最新高度
+	latestBlock, err := e.getLatestBlockNumber(ctx)
 	if err != nil {
-		log.Task.Warn("Error creating pool:", err)
-
+		log.Task.Warn(fmt.Sprintf("[%s] 获取最新高度失败: %v, 退避休眠 10 秒", e.Network, err))
+		time.Sleep(10 * time.Second)
 		return
 	}
 
-	defer p.Release()
-
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case n := <-e.blockScanQueue.Out:
-			if err := p.Invoke(n); err != nil {
-				e.blockScanQueue.In <- n
-
-				log.Task.Warn("Evm Block Dispatch Error invoking process block:", err)
-			}
+	// 6. 确定安全的扫描区间 [fromBlock, latestBlock]
+	var fromBlock int64
+	if last, ok := chainBlockNum.Load(e.Network); ok && last.(int64) > 0 {
+		fromBlock = last.(int64) + 1
+		// 如果落后太多（如重启服务），最大拉取跨度锁死在 maxQueryBlockSpan（50块）
+		if latestBlock-fromBlock > maxQueryBlockSpan {
+			fromBlock = latestBlock - maxQueryBlockSpan
 		}
+	} else {
+		// 首次运行或未记录高度：从 latest - 20 开始
+		fromBlock = latestBlock - 20
 	}
-}
 
-func (e *evm) getBlockByNumber(a any) {
-	b, ok := a.(evmBlock)
-	if !ok {
-		log.Task.Warn("Evm Block Parse Error: expected []int64, got", a)
-
+	if fromBlock > latestBlock {
 		return
 	}
 
-	items := make([]string, 0)
-	for i := b.From; i <= b.To; i++ {
-		items = append(items, fmt.Sprintf(`{"jsonrpc":"2.0","method":"eth_getBlockByNumber","params":["0x%x",%t],"id":%d}`, i, e.Native.Parse, i))
-	}
-
-	ctx, cancel := context.WithTimeout(context.Background(), time.Second*5)
-	defer cancel()
-
-	req, err := http.NewRequestWithContext(ctx, "POST", e.rpcEndpoint(), bytes.NewBuffer([]byte(fmt.Sprintf(`[%s]`, strings.Join(items, ",")))))
+	// 7. 发起单次精准 eth_getLogs
+	transfers, err := e.fetchFilteredLogs(ctx, fromBlock, latestBlock, contracts, wallets)
 	if err != nil {
-		log.Task.Warn("Error creating request:", err)
-
+		log.Task.Warn(fmt.Sprintf("[%s] 精准查询交易失败: %v, 退避休眠 10 秒", e.Network, err))
+		time.Sleep(10 * time.Second)
 		return
 	}
 
-	req.Header.Set("Content-Type", "application/json")
-	resp, err := e.Client.Do(req)
-	if err != nil {
-		conf.RecordFailure(e.Network)
-		e.blockScanQueue.In <- b
-		log.Task.Warn("eth_getBlockByNumber Error sending request:", err)
+	// 成功记录最新进度
+	chainBlockNum.Store(e.Network, latestBlock)
 
-		return
-	}
-
-	defer resp.Body.Close()
-
-	body, err := io.ReadAll(resp.Body)
-	if err != nil {
-		conf.RecordFailure(e.Network)
-		e.blockScanQueue.In <- b
-		log.Task.Warn("eth_getBlockByNumber Error reading response body:", err)
-
-		return
-	}
-
-	conf.RecordSuccess(e.Network, cast.ToString(b.To))
-
-	nativeTransfers := make([]transfer, 0)
-	blockTimestamp := make(map[string]time.Time)
-	for _, itm := range gjson.ParseBytes(body).Array() {
-		if itm.Get("error").Exists() {
-			conf.RecordFailure(e.Network)
-			e.blockScanQueue.In <- b
-			log.Task.Warn(fmt.Sprintf("%s eth_getBlockByNumber response error %s", e.Network, itm.Get("error").String()))
-
-			return
-		}
-
-		timestamp := utils.HexStr2Int(itm.Get("result.timestamp").String()).Int64()
-		blockTime := time.Unix(timestamp, 0)
-		blockNumHex := itm.Get("result.number").String()
-		blockTimestamp[blockNumHex] = blockTime
-
-		var array = itm.Get("result.transactions").Array()
-		if e.Native.Parse && len(array) != 0 {
-
-			nativeTransfers = append(nativeTransfers, e.parseNativeTransfer(array, int(utils.HexStr2Int(blockNumHex).Int64()), blockTime)...)
-		}
-	}
-
-	transfers, err := e.parseEventTransfer(b, blockTimestamp)
-	if err != nil {
-		conf.RecordFailure(e.Network)
-		e.blockScanQueue.In <- b
-		log.Task.Warn("Evm Block Parse Error parsing block transfer:", err)
-
-		return
-	}
-
-	if len(nativeTransfers) > 0 {
-		transferQueue.In <- nativeTransfers
-	}
+	// 8. 命中充值交易推入处理队列
 	if len(transfers) > 0 {
+		log.Task.Info(fmt.Sprintf("🎉 [%s] 精准捕获 %d 笔入账交易！区块范围: %d → %d", e.Network, len(transfers), fromBlock, latestBlock))
 		transferQueue.In <- transfers
 	}
-
-	log.Task.Info(fmt.Sprintf("区块扫描完成(%s): %d → %d 成功率：%s", e.Network, b.From, b.To, conf.GetSuccessRate(e.Network)))
 }
 
-func (e *evm) parseNativeTransfer(array []gjson.Result, num int, timestamp time.Time) []transfer {
-	nativeTransfers := make([]transfer, 0)
-	for _, tx := range array {
-		if tx.Get("input").String() != "0x" {
-			// 非原生币交易
-
-			continue
-		}
-
-		valStr := tx.Get("value").String()
-		if valStr == "0x0" || len(valStr) < 3 {
-			// 过滤 0 值交易
-
-			continue
-		}
-
-		amount, ok := big.NewInt(0).SetString(valStr[2:], 16)
-		if !ok || amount.Sign() <= 0 {
-
-			continue
-		}
-
-		toAddress := tx.Get("to").String()
-		if toAddress == "" { // 合约创建交易 to 为空
-
-			continue
-		}
-
-		nativeTransfers = append(nativeTransfers, transfer{
-			Network:     e.Network,
-			FromAddress: tx.Get("from").String(),
-			RecvAddress: toAddress,
-			Amount:      decimal.NewFromBigInt(amount, e.Native.Decimal),
-			TxHash:      tx.Get("hash").String(),
-			BlockNum:    num,
-			Timestamp:   timestamp,
-			TradeType:   e.Native.TradeType,
-		})
+// getLatestBlockNumber 获取链上当前最新高度
+func (e *evm) getLatestBlockNumber(ctx context.Context) (int64, error) {
+	post := []byte(`{"jsonrpc":"2.0","method":"eth_blockNumber","params":[],"id":1}`)
+	body, err := e.callRpc(ctx, post)
+	if err != nil {
+		return 0, err
 	}
 
-	return nativeTransfers
+	res := gjson.ParseBytes(body)
+	hexStr := res.Get("result").String()
+	if hexStr == "" {
+		return 0, errors.New("empty blockNumber result")
+	}
+
+	bn := utils.HexStr2Int(hexStr).Int64() - e.Block.RollDelayOffset
+	if bn <= 0 {
+		return 0, errors.New("invalid blockNumber")
+	}
+
+	return bn, nil
 }
 
-func (e *evm) parseEventTransfer(b evmBlock, timestamp map[string]time.Time) ([]transfer, error) {
+// fetchFilteredLogs 发送精确过滤的 eth_getLogs，由节点端直接过滤指定合约与指定收款钱包
+func (e *evm) fetchFilteredLogs(ctx context.Context, from, to int64, contracts []string, wallets []string) ([]transfer, error) {
 	transfers := make([]transfer, 0)
 
-	// 构建合约地址过滤器（address 字段）
-	contracts := model.GetNetworkContracts(model.Network(e.Network))
+	// 跨度强制保护：绝不允许超出 maxQueryBlockSpan
+	if to-from > maxQueryBlockSpan {
+		from = to - maxQueryBlockSpan
+	}
+
+	// 构建合约过滤 (address)
 	var addrFilter string
 	if len(contracts) == 1 {
-		addrFilter = fmt.Sprintf(`"address":"%s",`, contracts[0])
+		addrFilter = fmt.Sprintf(`"address":"%s",`, strings.ToLower(contracts[0]))
 	} else if len(contracts) > 1 {
 		quoted := make([]string, len(contracts))
 		for i, c := range contracts {
-			quoted[i] = fmt.Sprintf(`"%s"`, c)
+			quoted[i] = fmt.Sprintf(`"%s"`, strings.ToLower(c))
 		}
 		addrFilter = fmt.Sprintf(`"address":[%s],`, strings.Join(quoted, ","))
 	}
 
-	// 构建钱包地址过滤器（topic[2] = 收款方）
-	wallets := model.GetNetworkWalletAddrs(model.Network(e.Network))
+	// 构建钱包收款方过滤 (topic[2])
+	padded := make([]string, len(wallets))
+	for i, w := range wallets {
+		clean := strings.ToLower(strings.TrimPrefix(w, "0x"))
+		padded[i] = fmt.Sprintf(`"0x000000000000000000000000%s"`, clean)
+	}
 	var topicFilter string
-	if len(wallets) > 0 {
-		padded := make([]string, len(wallets))
-		for i, w := range wallets {
-			padded[i] = fmt.Sprintf(`"%s"`, "0x000000000000000000000000"+strings.TrimPrefix(w, "0x"))
-		}
-		if len(padded) == 1 {
-			topicFilter = fmt.Sprintf(`["%s",null,%s]`, evmTransferEvent, padded[0])
-		} else {
-			topicFilter = fmt.Sprintf(`["%s",null,[%s]]`, evmTransferEvent, strings.Join(padded, ","))
-		}
+	if len(padded) == 1 {
+		topicFilter = fmt.Sprintf(`["%s",null,%s]`, evmTransferEvent, padded[0])
 	} else {
-		topicFilter = fmt.Sprintf(`["%s"]`, evmTransferEvent)
+		topicFilter = fmt.Sprintf(`["%s",null,[%s]]`, evmTransferEvent, strings.Join(padded, ","))
 	}
 
-	post := []byte(fmt.Sprintf(`{"jsonrpc":"2.0","method":"eth_getLogs","params":[{%s"fromBlock":"0x%x","toBlock":"0x%x","topics":%s}],"id":1}`, addrFilter, b.From, b.To, topicFilter))
-	resp, err := e.Client.Post(e.rpcEndpoint(), "application/json", bytes.NewBuffer(post))
+	post := []byte(fmt.Sprintf(`{"jsonrpc":"2.0","method":"eth_getLogs","params":[{%s"fromBlock":"0x%x","toBlock":"0x%x","topics":%s}],"id":1}`,
+		addrFilter, from, to, topicFilter))
+
+	body, err := e.callRpc(ctx, post)
 	if err != nil {
-
-		return transfers, errors.Join(errors.New("eth_getLogs Post Error"), err)
-	}
-
-	defer resp.Body.Close()
-
-	body, err := io.ReadAll(resp.Body)
-	if err != nil {
-
-		return transfers, errors.Join(errors.New("eth_getLogs ReadAll Error"), err)
+		return nil, err
 	}
 
 	data := gjson.ParseBytes(body)
-	if data.Get("error").Exists() {
-
-		return transfers, errors.New(fmt.Sprintf("%s eth_getLogs response error %s", e.Network, data.Get("error").String()))
-	}
+	now := time.Now()
 
 	for _, itm := range data.Get("result").Array() {
-		to := itm.Get("address").String()
-		tradeType, ok := model.GetContractTrade(to)
+		toContract := strings.ToLower(itm.Get("address").String())
+		tradeType, ok := model.GetContractTrade(toContract)
 		if !ok {
-
 			continue
 		}
 
 		topics := itm.Get("topics").Array()
-		if len(topics) < 3 {
-
+		if len(topics) < 3 || topics[0].String() != evmTransferEvent {
 			continue
 		}
 
-		if topics[0].String() != evmTransferEvent { // transfer event signature
-
+		fromAddr := fmt.Sprintf("0x%s", topics[1].String()[26:])
+		recvAddr := fmt.Sprintf("0x%s", topics[2].String()[26:])
+		dataHex := itm.Get("data").String()
+		if len(dataHex) < 3 {
 			continue
 		}
 
-		from := fmt.Sprintf("0x%s", topics[1].String()[26:])
-		recv := fmt.Sprintf("0x%s", topics[2].String()[26:])
-		amount, ok := big.NewInt(0).SetString(itm.Get("data").String()[2:], 16)
+		amount, ok := big.NewInt(0).SetString(dataHex[2:], 16)
 		if !ok || amount.Sign() <= 0 {
-
 			continue
 		}
+
+		blockNum := cast.ToInt(utils.HexStr2Int(itm.Get("blockNumber").String()).Int64())
 
 		transfers = append(transfers, transfer{
 			Network:     e.Network,
-			FromAddress: from,
-			RecvAddress: recv,
-			Amount:      decimal.NewFromBigInt(amount, model.GetContractDecimal(to)),
+			FromAddress: strings.ToLower(fromAddr),
+			RecvAddress: strings.ToLower(recvAddr),
+			Amount:      decimal.NewFromBigInt(amount, model.GetContractDecimal(toContract)),
 			TxHash:      itm.Get("transactionHash").String(),
-			BlockNum:    cast.ToInt(itm.Get("blockNumber").String()),
-			Timestamp:   timestamp[itm.Get("blockNumber").String()],
+			BlockNum:    blockNum,
+			Timestamp:   now,
 			TradeType:   tradeType,
 		})
 	}
@@ -411,11 +243,71 @@ func (e *evm) parseEventTransfer(b evmBlock, timestamp map[string]time.Time) ([]
 	return transfers, nil
 }
 
-func (e *evm) tradeConfirmHandle(ctx context.Context) {
-	var orders = getConfirmingOrders(model.GetNetworkTrades(model.Network(e.Network)))
-	var wg sync.WaitGroup
+// callRpc 发送 RPC 请求，支持多节点故障自动切换与严格超时控制
+func (e *evm) callRpc(ctx context.Context, payload []byte) ([]byte, error) {
+	endpoints := []string{e.rpcEndpoint()}
+	if len(e.FallbackEndpoints) > 0 {
+		endpoints = append(endpoints, e.FallbackEndpoints...)
+	} else if e.Network == conf.Bsc && e.RpcEndpoint == "" {
+		// 为 BSC 链内置高可用备用公共节点，主节点异常时自动切换
+		for _, fb := range []string{"https://1rpc.io/bnb", "https://bsc-rpc.publicnode.com"} {
+			if fb != endpoints[0] {
+				endpoints = append(endpoints, fb)
+			}
+		}
+	}
 
-	var handle = func(o model.Order) {
+	var lastErr error
+	for _, ep := range endpoints {
+		reqCtx, cancel := context.WithTimeout(ctx, 6*time.Second)
+		req, err := http.NewRequestWithContext(reqCtx, "POST", ep, bytes.NewBuffer(payload))
+		if err != nil {
+			cancel()
+			lastErr = err
+			continue
+		}
+
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36")
+
+		resp, err := e.Client.Do(req)
+		if err != nil {
+			cancel()
+			lastErr = fmt.Errorf("[%s] HTTP请求失败: %w", ep, err)
+			continue
+		}
+
+		body, err := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		cancel()
+
+		if err != nil {
+			lastErr = fmt.Errorf("[%s] 读取响应失败: %w", ep, err)
+			continue
+		}
+
+		data := gjson.ParseBytes(body)
+		if data.Get("error").Exists() {
+			errMsg := data.Get("error.message").String()
+			lastErr = fmt.Errorf("[%s] RPC返回错误: %s", ep, errMsg)
+			continue
+		}
+
+		return body, nil
+	}
+
+	return nil, lastErr
+}
+
+// tradeConfirmHandle 确认待确认订单的区块回执，仅在有待确认订单时执行
+func (e *evm) tradeConfirmHandle(ctx context.Context) {
+	orders := getConfirmingOrders(model.GetNetworkTrades(model.Network(e.Network)))
+	if len(orders) == 0 {
+		return
+	}
+
+	var wg sync.WaitGroup
+	handle := func(o model.Order) {
 		if model.GetC(model.BlockOffsetConfirm) == "1" {
 			last, ok := chainBlockNum.Load(e.Network)
 			if !ok {
@@ -427,37 +319,13 @@ func (e *evm) tradeConfirmHandle(ctx context.Context) {
 		}
 
 		post := []byte(fmt.Sprintf(`{"jsonrpc":"2.0","method":"eth_getTransactionReceipt","params":["%s"],"id":1}`, o.RefHash))
-		req, err := http.NewRequestWithContext(ctx, "POST", e.rpcEndpoint(), bytes.NewBuffer(post))
+		body, err := e.callRpc(ctx, post)
 		if err != nil {
-			log.Task.Warn("evm tradeConfirmHandle Error creating request:", err)
-
-			return
-		}
-
-		req.Header.Set("Content-Type", "application/json")
-		resp, err := e.Client.Do(req)
-		if err != nil {
-			log.Task.Warn("evm tradeConfirmHandle Error sending request:", err)
-
-			return
-		}
-
-		defer resp.Body.Close()
-
-		body, err := io.ReadAll(resp.Body)
-		if err != nil {
-			log.Task.Warn("evm tradeConfirmHandle Error reading response body:", err)
-
+			log.Task.Warn(fmt.Sprintf("[%s] tradeConfirmHandle 获取回执失败: %v", e.Network, err))
 			return
 		}
 
 		data := gjson.ParseBytes(body)
-		if data.Get("error").Exists() {
-			log.Task.Warn(fmt.Sprintf("%s eth_getTransactionReceipt response error %s", e.Network, data.Get("error").String()))
-
-			return
-		}
-
 		if data.Get("result.status").String() == "0x1" {
 			markFinalConfirmed(o)
 		}
@@ -465,24 +333,26 @@ func (e *evm) tradeConfirmHandle(ctx context.Context) {
 
 	for _, order := range orders {
 		wg.Add(1)
-		go func() {
+		go func(o model.Order) {
 			defer wg.Done()
-			handle(order)
-		}()
+			handle(o)
+		}(order)
 	}
 
 	wg.Wait()
 }
 
 func (e *evm) rpcEndpoint() string {
-
+	if e.RpcEndpoint != "" {
+		return e.RpcEndpoint
+	}
 	return model.Endpoint(model.Network(e.Network))
 }
 
+// syncBreak 保留函数，供 aptos.go 和 solana.go 编译兼容
 func syncBreak(network string, num int) bool {
 	if num >= blockQueueLimit {
 		log.Task.Warn(fmt.Sprintf("%s 同步阻塞，当前区块消费堆积数量：%d", network, num))
-
 		return true
 	}
 
@@ -492,7 +362,6 @@ func syncBreak(network string, num int) bool {
 
 	trades := model.GetNetworkTrades(model.Network(network))
 	if len(trades) == 0 {
-
 		return true
 	}
 
@@ -501,7 +370,6 @@ func syncBreak(network string, num int) bool {
 		Where("other_notify = ? and trade_type in (?)", model.WaOtherEnable, trades).
 		Count(&count)
 	if count > 0 {
-
 		return false
 	}
 

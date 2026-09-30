@@ -1,33 +1,28 @@
 package task
 
 import (
-	"context"
 	"time"
 
-	"github.com/smallnest/chanx"
 	"github.com/v03413/bepusdt/app/conf"
 	"github.com/v03413/bepusdt/app/model"
 	"github.com/v03413/bepusdt/app/utils"
 )
 
 func bscInit() {
-	ctx := context.Background()
 	bsc := evm{
 		Network: conf.Bsc,
 		Block: block{
 			ConfirmedOffset: 15,
 		},
 		Native: evmNative{
-			Parse:     false, // 关闭原生 BNB 整块下载，我们只监控 USDT/USDC 代币转账
+			Parse:     false,
 			Decimal:   conf.BscBnbDecimals,
 			TradeType: model.BscBnb,
 		},
-		Client:         utils.NewHttpClient(),
-		blockScanQueue: chanx.NewUnboundedChan[evmBlock](ctx, 30),
+		Client: utils.NewHttpClient(),
 	}
 
-	Register(Task{Callback: bsc.blockDispatch})
-	Register(Task{Callback: bsc.syncBlocksForward, Duration: time.Second * 5})
-	Register(Task{Callback: bsc.tradeConfirmHandle, Duration: time.Second * 5})
-	Register(Task{Callback: bsc.lookbackBlocks, Duration: time.Second * 15})
+	// 方案 B：按需定时单次轮询，彻底告别扫块队列和死循环
+	Register(Task{Duration: time.Second * 10, Callback: bsc.pollOrderTransfers})
+	Register(Task{Duration: time.Second * 10, Callback: bsc.tradeConfirmHandle})
 }
